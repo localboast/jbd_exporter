@@ -47,18 +47,17 @@ int setup_serial(const char *portname) {
         return -1;
     }
 
-    // Set Baud Rate to 9600
     cfsetospeed(&tty, B9600);
     cfsetispeed(&tty, B9600);
 
-    // --- CRITICAL FIX: Use cfmakeraw to safely disable all processing ---
+    // Use cfmakeraw to safely disable all kernel processing (ISTRIP, echo, etc.)
     cfmakeraw(&tty);
 
-    // Manual overrides to ensure specific settings match JBD reqs
-    tty.c_cflag |= (CLOCAL | CREAD); // Enable receiver
+    // Manual overrides for JBD requirements
+    tty.c_cflag |= (CLOCAL | CREAD); // Enable receiver, ignore modem control lines
     tty.c_cflag &= ~CSTOPB;          // 1 stop bit
     tty.c_cflag &= ~CRTSCTS;         // Disable hardware flow control
-    tty.c_cc[VMIN]  = 0;             // Non-blocking read (we use VTIME)
+    tty.c_cc[VMIN]  = 0;             // Non-blocking read (we rely on VTIME)
     tty.c_cc[VTIME] = 20;            // 2.0 Seconds Timeout
 
     if (tcsetattr(fd, TCSANOW, &tty) != 0) {
@@ -66,7 +65,7 @@ int setup_serial(const char *portname) {
         return -1;
     }
 
-    // Flush any garbage in the buffer
+    // Flush any garbage in the OS buffer before starting
     tcflush(fd, TCIOFLUSH);
     return fd;
 }
@@ -87,18 +86,9 @@ int send_and_read(int fd, uint8_t reg, uint8_t *out_buffer, int max_len) {
 
     // 2. Build Packet
     uint8_t cmd[7];
-    cmd[0] = 0xDD; // Start
-    cmd[1] = 0xA5; // Read
-    cmd[2] = reg;
-    cmd[3] = 0x00; // Len
-
-    // Checksum: Sum of payload bytes (starting at offset 2, len 2)
+    cmd[0] = 0xDD; cmd[1] = 0xA5; cmd[2] = reg; cmd[3] = 0x00;
     uint16_t cs = jbd_checksum(&cmd[2], 2);
-    cmd[4] = (cs >> 8) & 0xFF;
-    cmd[5] = cs & 0xFF;
-    cmd[6] = 0x77; // End
-
-    print_hex("TX", cmd, 7);
+    cmd[4] = (cs >> 8) & 0xFF; cmd[5] = cs & 0xFF; cmd[6] = 0x77;
 
     if (write(fd, cmd, 7) != 7) {
         perror("Write failed");
@@ -106,40 +96,26 @@ int send_and_read(int fd, uint8_t reg, uint8_t *out_buffer, int max_len) {
     }
 
     // 3. Read Response
-    // We look for 0xDD start byte.
     int total_read = 0;
     int aligned = 0;
     uint8_t header[4];
 
-    // Try to find header (timeout handled by VTIME in serial config)
+    // Find header
     while (total_read < 4) {
         uint8_t byte;
         int n = read(fd, &byte, 1);
-
-        if (n < 0) {
-            perror("Read Error");
-            return -1;
-        }
-        if (n == 0) {
-            // Timeout hit
-            return -2;
-        }
+        if (n <= 0) return -2; // Timeout or error
 
         if (!aligned) {
             if (byte == 0xDD) {
                 aligned = 1;
                 header[0] = byte;
                 total_read = 1;
-            } else {
-                // If we see 0x5D here, it confirms the previous ISTRIP bug.
-                // printf("Skipping byte: %02X\n", byte);
             }
         } else {
             header[total_read++] = byte;
         }
     }
-
-    print_hex("RX Header", header, 4);
 
     if (header[2] != 0x00) {
         printf("BMS Status Error: %02X\n", header[2]);
@@ -147,13 +123,12 @@ int send_and_read(int fd, uint8_t reg, uint8_t *out_buffer, int max_len) {
     }
 
     int data_len = header[3];
-    int expected_remaining = data_len + 3; // Data + CS(2) + End(1)
-
+    int expected_remaining = data_len + 3;
     if (4 + expected_remaining > max_len) return -4; // Buffer too small
 
     memcpy(out_buffer, header, 4);
 
-    // Read Payload
+    // Read payload
     int rem_read = 0;
     while(rem_read < expected_remaining) {
         int n = read(fd, out_buffer + 4 + rem_read, expected_remaining - rem_read);
@@ -161,22 +136,17 @@ int send_and_read(int fd, uint8_t reg, uint8_t *out_buffer, int max_len) {
         rem_read += n;
     }
 
-    print_hex("RX Full", out_buffer, 4 + expected_remaining);
-
-    // Validate Checksum (Robust Logic)
+    // Validate checksum
     uint8_t *data_ptr = &out_buffer[4];
     uint16_t recv_cs = (out_buffer[4 + data_len] << 8) | out_buffer[4 + data_len + 1];
 
-    // Method 1: Standard
     uint8_t cs_buf1[256];
-    cs_buf1[0] = header[2];
-    cs_buf1[1] = header[3];
+    cs_buf1[0] = header[2]; cs_buf1[1] = header[3];
     memcpy(&cs_buf1[2], data_ptr, data_len);
     uint16_t calc_cs1 = jbd_checksum(cs_buf1, data_len + 2);
 
     int valid = 0;
     if (recv_cs == calc_cs1) valid = 1;
-    // Checksum Quirk from your working driver
     else if (reg == 0x04 && (recv_cs + 0x30 == calc_cs1)) valid = 1;
 
     if (!valid) {
@@ -200,7 +170,10 @@ void load_config(const char *filename) {
         else if (strcmp(key, "baud_rate") == 0) config.baud_rate = atoi(val);
         else if (strcmp(key, "mqtt_broker") == 0) strcpy(config.mqtt_broker, val);
         else if (strcmp(key, "mqtt_port") == 0) config.mqtt_port = atoi(val);
+        else if (strcmp(key, "mqtt_user") == 0) strcpy(config.mqtt_user, val);
+        else if (strcmp(key, "mqtt_password") == 0) strcpy(config.mqtt_password, val);
         else if (strcmp(key, "poll_interval") == 0) config.poll_interval = atoi(val);
+        else if (strcmp(key, "device_name") == 0) strcpy(config.device_name, val);
         else if (strcmp(key, "device_id") == 0) strcpy(config.device_id, val);
     }
     fclose(f);
@@ -224,7 +197,7 @@ void publish_config(struct mosquitto *mosq, const char *sid, const char *name, c
 
     cJSON *dev = cJSON_CreateObject();
     cJSON_AddStringToObject(dev, "identifiers", config.device_id);
-    cJSON_AddStringToObject(dev, "name", "JBD BMS");
+    cJSON_AddStringToObject(dev, "name", config.device_name);
     cJSON_AddStringToObject(dev, "manufacturer", "JBD");
     cJSON_AddItemToObject(root, "device", dev);
 
@@ -234,6 +207,7 @@ void publish_config(struct mosquitto *mosq, const char *sid, const char *name, c
 }
 
 void send_discovery(struct mosquitto *mosq, int cells, int ntcs) {
+    printf("Sending Home Assistant discovery messages...\n");
     publish_config(mosq, "pack_voltage", "Pack Voltage", "V", "voltage");
     publish_config(mosq, "pack_current", "Pack Current", "A", "current");
     publish_config(mosq, "soc", "SOC", "%", "battery");
@@ -251,37 +225,55 @@ void send_discovery(struct mosquitto *mosq, int cells, int ntcs) {
         snprintf(n, 32, "Temp %d", i+1);
         publish_config(mosq, s, n, "°C", "temperature");
     }
+    printf("Discovery messages sent.\n");
 }
 
 int main() {
+    // Set default values
     strcpy(config.serial_port, "/dev/ttyUSB0");
     config.baud_rate = 9600;
     strcpy(config.mqtt_broker, "127.0.0.1");
     config.mqtt_port = 1883;
     config.poll_interval = 10;
+    strcpy(config.device_name, "JBD BMS");
     strcpy(config.device_id, "jbd_exporter");
+    config.mqtt_user[0] = '\0';
+    config.mqtt_password[0] = '\0';
 
+    // Load settings from config file
     load_config("config.ini");
 
-    printf("--- JBD Exporter (Raw Mode Fixed) ---\n");
-    printf("Port: %s | Broker: %s\n", config.serial_port, config.mqtt_broker);
+    printf("--- JBD Exporter Starting ---\n");
+    printf("Port: %s | Broker: %s:%d\n", config.serial_port, config.mqtt_broker, config.mqtt_port);
 
+    // --- MQTT Setup ---
     mosquitto_lib_init();
     struct mosquitto *mosq = mosquitto_new(config.device_id, true, NULL);
-    if(mosquitto_connect(mosq, config.mqtt_broker, config.mqtt_port, 60) != MOSQ_ERR_SUCCESS) {
-        printf("MQTT Connect Fail\n");
+
+    if (strlen(config.mqtt_user) > 0) {
+        printf("Using MQTT username: %s\n", config.mqtt_user);
+        mosquitto_username_pw_set(mosq, config.mqtt_user, config.mqtt_password);
+    } else {
+        printf("Connecting to MQTT anonymously.\n");
+    }
+
+    int rc = mosquitto_connect(mosq, config.mqtt_broker, config.mqtt_port, 60);
+    if(rc != MOSQ_ERR_SUCCESS) {
+        printf("MQTT Connect Failed: %s\n", mosquitto_strerror(rc));
         return 1;
     }
+    printf("MQTT connection successful.\n");
     mosquitto_loop_start(mosq);
 
+    // --- Serial Setup ---
     int fd = setup_serial(config.serial_port);
     if(fd < 0) return 1;
 
     uint8_t buf[512];
     int discovery_done = 0;
 
+    // --- Main Loop ---
     while(1) {
-        printf("\nReading 0x03...\n");
         int len = send_and_read(fd, 0x03, buf, sizeof(buf));
 
         if (len > 0) {
@@ -291,7 +283,6 @@ int main() {
             int16_t a = (int16_t)((d[2]<<8)|d[3]);
             uint16_t cap = (d[4]<<8)|d[5];
             uint16_t cyc = (d[8]<<8)|d[9];
-            uint16_t prot = (d[16]<<8)|d[17];
             uint8_t soc = d[19];
             int cells = d[21];
             int ntcs = d[22];
@@ -301,9 +292,8 @@ int main() {
             cJSON_AddNumberToObject(json, "capacity_remain", cap/100.0);
             cJSON_AddNumberToObject(json, "cycles", cyc);
             cJSON_AddNumberToObject(json, "soc", soc);
-            cJSON_AddNumberToObject(json, "protection", prot);
 
-            // Temps
+            // Temperatures
             int offset = 23;
             for(int i=0; i<ntcs; i++) {
                 if(offset+1 < buf[3]) {
@@ -314,10 +304,9 @@ int main() {
                 }
             }
 
-            // Cells
+            // Cell Voltages
             if (cells > 0) {
                 usleep(200000);
-                printf("Reading 0x04...\n");
                 int clen = send_and_read(fd, 0x04, buf, sizeof(buf));
                 if (clen > 0) {
                     uint8_t *cd = &buf[4];
@@ -331,18 +320,22 @@ int main() {
                 }
             }
 
+            // Publish status data
             char *pl = cJSON_PrintUnformatted(json);
-            mosquitto_publish(mosq, NULL, "jbd_exporter/status", strlen(pl), pl, 0, false);
-            printf("MQTT Sent: SOC %d%%\n", soc);
+            char topic[128];
+            snprintf(topic, 128, "%s/status", config.device_id);
+            mosquitto_publish(mosq, NULL, topic, strlen(pl), pl, 0, false);
+            printf("MQTT Status Sent (SOC %d%%)\n", soc);
             free(pl);
             cJSON_Delete(json);
 
+            // Send discovery messages only once after we know cell/temp counts
             if (!discovery_done && cells > 0) {
                 send_discovery(mosq, cells, ntcs);
                 discovery_done = 1;
             }
         } else {
-            printf("Read Failed 0x03. Err Code: %d\n", len);
+            printf("Read Failed (Err Code: %d). Retrying...\n", len);
         }
 
         sleep(config.poll_interval);
