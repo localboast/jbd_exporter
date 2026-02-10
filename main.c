@@ -24,7 +24,16 @@ typedef struct {
 
 AppConfig config;
 
-// --- Serial Helpers ---
+// --- Helper: Hex Dump for Debugging ---
+void print_hex(const char *label, uint8_t *data, int len) {
+    printf("%s: ", label);
+    for (int i = 0; i < len; i++) {
+        printf("%02X ", data[i]);
+    }
+    printf("\n");
+}
+
+// --- Serial Setup ---
 int setup_serial(const char *portname) {
     int fd = open(portname, O_RDWR | O_NOCTTY | O_SYNC);
     if (fd < 0) {
@@ -33,38 +42,37 @@ int setup_serial(const char *portname) {
     }
 
     struct termios tty;
-    if (tcgetattr(fd, &tty) != 0) {
-        fprintf(stderr, "Error from tcgetattr: %s\n", strerror(errno));
-        return -1;
-    }
+    if (tcgetattr(fd, &tty) != 0) return -1;
 
     cfsetospeed(&tty, B9600);
     cfsetispeed(&tty, B9600);
 
-    tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8; // 8-bit chars
-    tty.c_cflag |= (CLOCAL | CREAD);            // ignore modem controls, enable reading
-    tty.c_cflag &= ~(PARENB | PARODD);          // shut off parity
-    tty.c_cflag &= ~CSTOPB;                     // 1 stop bit
-    tty.c_cflag &= ~CRTSCTS;                    // no flow control
+    tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
+    tty.c_cflag |= (CLOCAL | CREAD);
+    tty.c_cflag &= ~(PARENB | PARODD);
+    tty.c_cflag &= ~CSTOPB;
+    tty.c_cflag &= ~CRTSCTS;
 
     // Raw mode
     tty.c_lflag = 0;
     tty.c_oflag = 0;
     tty.c_iflag = ~(IXON | IXOFF | IXANY);
 
-    // Timeout settings (crucial for RS485)
-    tty.c_cc[VMIN]  = 0;            // read doesn't block
-    tty.c_cc[VTIME] = 10;           // 1.0 seconds read timeout
+    // Timeout: Important for JBD
+    tty.c_cc[VMIN]  = 0;
+    tty.c_cc[VTIME] = 10; // 1.0 second timeout
 
-    if (tcsetattr(fd, TCSANOW, &tty) != 0) {
-        fprintf(stderr, "Error from tcsetattr: %s\n", strerror(errno));
-        return -1;
-    }
+    if (tcsetattr(fd, TCSANOW, &tty) != 0) return -1;
+
+    // Clear any garbage currently in buffer
+    tcflush(fd, TCIOFLUSH);
     return fd;
 }
 
-// --- JBD Protocol ---
-uint16_t calculate_checksum(uint8_t *data, int len) {
+// --- JBD Protocol Implementation (Based on your Reference) ---
+
+// Standard JBD Checksum: 0x10000 - sum
+uint16_t jbd_checksum(uint8_t *data, int len) {
     uint32_t sum = 0;
     for (int i = 0; i < len; i++) {
         sum += data[i];
@@ -72,62 +80,129 @@ uint16_t calculate_checksum(uint8_t *data, int len) {
     return (uint16_t)((0x10000 - sum) & 0xFFFF);
 }
 
-void send_read_command(int fd, uint8_t reg) {
-    uint8_t cmd[] = {0xDD, 0xA5, reg, 0x00, 0x00, 0x00, 0x77};
-    // Calculate checksum for payload bytes: Command(0xA5), Reg, Len(0x00)
-    uint16_t cs = calculate_checksum(&cmd[1], 3);
-    cmd[4] = (cs >> 8) & 0xFF;
-    cmd[5] = cs & 0xFF;
-
-    tcflush(fd, TCIFLUSH);
-    write(fd, cmd, 7);
+// Flush input buffer manually (robustness fix)
+void flush_input(int fd) {
+    uint8_t garbage[128];
+    while(read(fd, garbage, sizeof(garbage)) > 0);
 }
 
-int read_response(int fd, uint8_t *buffer, int max_len) {
+int send_and_read(int fd, uint8_t reg, uint8_t *out_buffer, int max_len) {
+    // 1. Flush Input Buffer (Crucial for RS485 echoes)
+    flush_input(fd);
+
+    // 2. Build Packet
+    // Protocol: Start(DD) | Read(A5) | Reg | Len(0) | CS_H | CS_L | End(77)
+    uint8_t cmd[7];
+    cmd[0] = 0xDD;
+    cmd[1] = 0xA5;
+    cmd[2] = reg;
+    cmd[3] = 0x00;
+
+    // Calculate Checksum on [Reg, Len] only, matching your reference code
+    // (Some firmwares vary, but your reference checks specific bytes)
+    uint16_t cs = jbd_checksum(&cmd[2], 2);
+
+    cmd[4] = (cs >> 8) & 0xFF;
+    cmd[5] = cs & 0xFF;
+    cmd[6] = 0x77;
+
+    // 3. Send
+    // printf("Sending CMD: %02X\n", reg); // Uncomment to debug TX
+    if (write(fd, cmd, 7) != 7) {
+        perror("Write failed");
+        return -1;
+    }
+
+    // 4. Wait slightly (Reference uses 100ms)
+    usleep(100000);
+
+    // 5. Read Response - Robust Loop
+    // We look for 0xDD first to align the frame
+    uint8_t byte;
     int bytes_read = 0;
+    int aligned = 0;
     int total_read = 0;
 
-    // Read Header (4 bytes: Start, Reg, Status, Len)
-    while (total_read < 4) {
-        bytes_read = read(fd, buffer + total_read, 4 - total_read);
-        if (bytes_read <= 0) return -1;
-        total_read += bytes_read;
+    // Read Header (4 bytes)
+    uint8_t header[4];
+    while(total_read < 4) {
+        int n = read(fd, &byte, 1);
+        if (n <= 0) return -2; // Timeout
+
+        if (!aligned) {
+            if (byte == 0xDD) {
+                aligned = 1;
+                header[0] = byte;
+                total_read = 1;
+            }
+        } else {
+            header[total_read++] = byte;
+        }
     }
 
-    if (buffer[0] != 0xDD) return -2; // Bad start
-    if (buffer[2] != 0x00) return -3; // BMS Error Status
-
-    int data_len = buffer[3];
-    int expected_total = 4 + data_len + 3; // Header(4) + Data(N) + CS(2) + End(1)
-
-    if (expected_total > max_len) return -4; // Buffer overflow
-
-    while (total_read < expected_total) {
-        bytes_read = read(fd, buffer + total_read, expected_total - total_read);
-        if (bytes_read <= 0) return -1;
-        total_read += bytes_read;
+    // Header: [DD] [Reg] [Status] [Len]
+    if (header[2] != 0x00) {
+        printf("BMS Error Status: %02X\n", header[2]);
+        return -3;
     }
 
-    if (buffer[expected_total - 1] != 0x77) return -5; // Bad end
+    int data_len = header[3];
+    int expected_remaining = data_len + 3; // Data + CS(2) + End(1)
 
-    // Validate Checksum (Reg + Status + Len + DataBytes)
-    uint16_t calc_cs = calculate_checksum(&buffer[1], data_len + 3);
-    uint16_t recv_cs = (buffer[expected_total - 3] << 8) | buffer[expected_total - 2];
+    if (4 + expected_remaining > max_len) return -4; // Buffer too small
 
-    if (calc_cs != recv_cs) {
-        printf("Checksum mismatch! Calc: %04X, Recv: %04X\n", calc_cs, recv_cs);
-        return -6;
+    // Copy header to out_buffer
+    memcpy(out_buffer, header, 4);
+
+    // Read remaining bytes
+    int rem_read = 0;
+    while(rem_read < expected_remaining) {
+        int n = read(fd, out_buffer + 4 + rem_read, expected_remaining - rem_read);
+        if (n <= 0) return -2;
+        rem_read += n;
     }
 
-    return data_len; // Return length of actual payload
+    // 6. Validate Checksum (Permissive Mode from Reference)
+    uint8_t *data_ptr = &out_buffer[4];
+    uint16_t recv_cs = (out_buffer[4 + data_len] << 8) | out_buffer[4 + data_len + 1];
+
+    // Checksum 1: Status + Len + Data (Standard)
+    // Construct buffer for calc: [Status, Len, Data...]
+    uint8_t cs_buf1[256];
+    cs_buf1[0] = header[2]; // Status
+    cs_buf1[1] = header[3]; // Len
+    memcpy(&cs_buf1[2], data_ptr, data_len);
+    uint16_t calc_cs1 = jbd_checksum(cs_buf1, data_len + 2);
+
+    // Checksum 2: Cmd + Status + Len + Data (Variant)
+    uint8_t cs_buf2[256];
+    cs_buf2[0] = header[1]; // Cmd (Reg)
+    cs_buf2[1] = header[2]; // Status
+    cs_buf2[2] = header[3]; // Len
+    memcpy(&cs_buf2[3], data_ptr, data_len);
+    uint16_t calc_cs2 = jbd_checksum(cs_buf2, data_len + 3);
+
+    int valid = 0;
+    if (recv_cs == calc_cs1) valid = 1;
+    else if (recv_cs == calc_cs2) valid = 1;
+    // Quirk for 0x04 from your reference
+    else if (reg == 0x04 && (recv_cs + 0x30 == calc_cs1)) valid = 1;
+
+    if (!valid) {
+        printf("CS Fail. Recv: %04X, Calc1: %04X, Calc2: %04X\n", recv_cs, calc_cs1, calc_cs2);
+        print_hex("Raw Packet", out_buffer, 4 + expected_remaining);
+        return -5;
+    }
+
+    return 4 + expected_remaining; // Return total frame length
 }
 
 // --- Config Parser ---
 void load_config(const char *filename) {
     FILE *f = fopen(filename, "r");
     if (!f) {
-        perror("Could not open config file");
-        exit(1);
+        printf("Config file not found, using defaults.\n");
+        return;
     }
 
     char line[256];
@@ -150,183 +225,158 @@ void load_config(const char *filename) {
 }
 
 // --- MQTT Discovery ---
-void publish_sensor_config(struct mosquitto *mosq, const char *sensor_id, const char *name, const char *unit, const char *dev_class) {
-    char topic[256];
-    snprintf(topic, sizeof(topic), "homeassistant/sensor/%s/%s/config", config.device_id, sensor_id);
-
+void publish_config(struct mosquitto *mosq, const char *sid, const char *name, const char *unit, const char *cls) {
     cJSON *root = cJSON_CreateObject();
-    char full_name[128];
+    char full_name[128], topic[256], uniq[128], state[128], tmpl[64];
+
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/%s/%s/config", config.device_id, sid);
     snprintf(full_name, sizeof(full_name), "%s %s", config.device_name, name);
+    snprintf(uniq, sizeof(uniq), "%s_%s", config.device_id, sid);
+    snprintf(state, sizeof(state), "%s/status", config.device_id);
+    snprintf(tmpl, sizeof(tmpl), "{{ value_json.%s }}", sid);
+
     cJSON_AddStringToObject(root, "name", full_name);
-
-    char state_topic[128];
-    snprintf(state_topic, sizeof(state_topic), "%s/status", config.device_id);
-    cJSON_AddStringToObject(root, "state_topic", state_topic);
-
-    char tmpl[64];
-    snprintf(tmpl, sizeof(tmpl), "{{ value_json.%s }}", sensor_id);
+    cJSON_AddStringToObject(root, "state_topic", state);
     cJSON_AddStringToObject(root, "value_template", tmpl);
+    cJSON_AddStringToObject(root, "unique_id", uniq);
+    if(unit) cJSON_AddStringToObject(root, "unit_of_measurement", unit);
+    if(cls) cJSON_AddStringToObject(root, "device_class", cls);
 
-    if (unit) cJSON_AddStringToObject(root, "unit_of_measurement", unit);
-    if (dev_class) cJSON_AddStringToObject(root, "device_class", dev_class);
+    cJSON *dev = cJSON_CreateObject();
+    cJSON_AddStringToObject(dev, "identifiers", config.device_id);
+    cJSON_AddStringToObject(dev, "name", config.device_name);
+    cJSON_AddStringToObject(dev, "manufacturer", "JBD");
+    cJSON_AddItemToObject(root, "device", dev);
 
-    char unique_id[128];
-    snprintf(unique_id, sizeof(unique_id), "%s_%s", config.device_id, sensor_id);
-    cJSON_AddStringToObject(root, "unique_id", unique_id);
-
-    cJSON *device = cJSON_CreateObject();
-    cJSON_AddStringToObject(device, "identifiers", config.device_id);
-    cJSON_AddStringToObject(device, "name", config.device_name);
-    cJSON_AddStringToObject(device, "manufacturer", "JBD");
-    cJSON_AddStringToObject(device, "model", "RS485 BMS");
-    cJSON_AddItemToObject(root, "device", device);
-
-    char *json_str = cJSON_PrintUnformatted(root);
-    mosquitto_publish(mosq, NULL, topic, strlen(json_str), json_str, 0, true);
-    free(json_str);
+    char *payload = cJSON_PrintUnformatted(root);
+    mosquitto_publish(mosq, NULL, topic, strlen(payload), payload, 0, true);
+    free(payload);
     cJSON_Delete(root);
 }
 
-void send_discovery(struct mosquitto *mosq, int cell_count, int ntc_count) {
-    publish_sensor_config(mosq, "pack_voltage", "Pack Voltage", "V", "voltage");
-    publish_sensor_config(mosq, "pack_current", "Pack Current", "A", "current");
-    publish_sensor_config(mosq, "soc", "SOC", "%", "battery");
-    publish_sensor_config(mosq, "capacity_remain", "Capacity Remaining", "Ah", NULL);
-    publish_sensor_config(mosq, "cycles", "Cycles", NULL, NULL);
+void send_discovery(struct mosquitto *mosq, int cells, int ntcs) {
+    publish_config(mosq, "pack_voltage", "Pack Voltage", "V", "voltage");
+    publish_config(mosq, "pack_current", "Pack Current", "A", "current");
+    publish_config(mosq, "soc", "SOC", "%", "battery");
+    publish_config(mosq, "capacity_remain", "Capacity Remaining", "Ah", NULL);
+    publish_config(mosq, "cycles", "Cycles", NULL, NULL);
 
-    // Cell Voltages
-    for (int i = 0; i < cell_count; i++) {
-        char id[32], name[32];
-        snprintf(id, sizeof(id), "cell_%d", i+1);
-        snprintf(name, sizeof(name), "Cell %d", i+1);
-        publish_sensor_config(mosq, id, name, "V", "voltage");
+    for(int i=0; i<cells; i++) {
+        char s[32], n[32];
+        snprintf(s, 32, "cell_%d", i+1);
+        snprintf(n, 32, "Cell %d", i+1);
+        publish_config(mosq, s, n, "V", "voltage");
     }
-
-    // Temperatures
-    for (int i = 0; i < ntc_count; i++) {
-        char id[32], name[32];
-        snprintf(id, sizeof(id), "temp_%d", i+1);
-        snprintf(name, sizeof(name), "Temp %d", i+1);
-        publish_sensor_config(mosq, id, name, "°C", "temperature");
+    for(int i=0; i<ntcs; i++) {
+        char s[32], n[32];
+        snprintf(s, 32, "temp_%d", i+1);
+        snprintf(n, 32, "Temp %d", i+1);
+        publish_config(mosq, s, n, "°C", "temperature");
     }
-
-    printf("Home Assistant Discovery Config Sent\n");
 }
 
 int main() {
+    // Defaults
+    strcpy(config.serial_port, "/dev/ttyUSB0");
+    config.baud_rate = 9600;
+    strcpy(config.mqtt_broker, "127.0.0.1");
+    config.mqtt_port = 1883;
+    config.poll_interval = 10;
+    strcpy(config.device_name, "JBD BMS");
+    strcpy(config.device_id, "jbd_exporter");
+
     load_config("config.ini");
-    printf("Starting JBD Exporter for %s on %s\n", config.device_name, config.serial_port);
+
+    printf("--- JBD Exporter Starting ---\n");
+    printf("Port: %s | Broker: %s\n", config.serial_port, config.mqtt_broker);
 
     mosquitto_lib_init();
     struct mosquitto *mosq = mosquitto_new(config.device_id, true, NULL);
-    if (strlen(config.mqtt_user) > 0) {
-        mosquitto_username_pw_set(mosq, config.mqtt_user, config.mqtt_password);
-    }
+    if(strlen(config.mqtt_user)>0) mosquitto_username_pw_set(mosq, config.mqtt_user, config.mqtt_password);
 
-    if (mosquitto_connect(mosq, config.mqtt_broker, config.mqtt_port, 60) != MOSQ_ERR_SUCCESS) {
-        fprintf(stderr, "Failed to connect to MQTT broker\n");
+    if(mosquitto_connect(mosq, config.mqtt_broker, config.mqtt_port, 60) != MOSQ_ERR_SUCCESS) {
+        printf("MQTT Connection Failed\n");
         return 1;
     }
     mosquitto_loop_start(mosq);
 
-    int serial_fd = setup_serial(config.serial_port);
-    if (serial_fd < 0) return 1;
+    int fd = setup_serial(config.serial_port);
+    if(fd < 0) return 1;
 
-    uint8_t rx_buffer[256];
-    int discovery_sent = 0;
+    uint8_t buf[256];
+    int discovery_done = 0;
 
-    while (1) {
+    while(1) {
         cJSON *json = cJSON_CreateObject();
 
-        // --- 1. Read Register 0x03 (Basic Info & Temps) ---
-        send_read_command(serial_fd, 0x03);
-        usleep(100000); // Wait 100ms
-        int len = read_response(serial_fd, rx_buffer, sizeof(rx_buffer));
+        // 1. Read Basic Info (0x03)
+        int len = send_and_read(fd, 0x03, buf, sizeof(buf));
+        int cells = 0, ntcs = 0;
 
-        int cell_count = 0;
-        int ntc_count = 0;
+        if(len > 0) {
+            uint8_t *d = &buf[4]; // Data start
+            uint16_t volt = (d[0]<<8)|d[1];
+            int16_t amps = (int16_t)((d[2]<<8)|d[3]);
+            uint16_t cap = (d[4]<<8)|d[5];
+            uint16_t cyc = (d[8]<<8)|d[9];
+            uint16_t prot = (d[16]<<8)|d[17];
+            uint8_t soc = d[19];
+            cells = d[21];
+            ntcs = d[22];
 
-        if (len > 0) {
-            uint8_t *data = &rx_buffer[4]; // Skip header
-
-            // Basic Info (Offsets based on glossary)
-            uint16_t pack_mv = (data[0] << 8) | data[1];
-            int16_t pack_ma = (int16_t)((data[2] << 8) | data[3]);
-            uint16_t cap_rem = (data[4] << 8) | data[5];
-            uint16_t cycles = (data[8] << 8) | data[9];
-            uint16_t protect = (data[16] << 8) | data[17];
-            uint8_t soc = data[19];
-            uint8_t fet_status = data[20];
-
-            cell_count = data[21];
-            ntc_count = data[22];
-
-            cJSON_AddNumberToObject(json, "pack_voltage", pack_mv / 100.0);
-            cJSON_AddNumberToObject(json, "pack_current", pack_ma / 100.0);
-            cJSON_AddNumberToObject(json, "capacity_remain", cap_rem / 100.0);
-            cJSON_AddNumberToObject(json, "cycles", cycles);
+            cJSON_AddNumberToObject(json, "pack_voltage", volt/100.0);
+            cJSON_AddNumberToObject(json, "pack_current", amps/100.0);
+            cJSON_AddNumberToObject(json, "capacity_remain", cap/100.0);
+            cJSON_AddNumberToObject(json, "cycles", cyc);
             cJSON_AddNumberToObject(json, "soc", soc);
-            cJSON_AddNumberToObject(json, "protection_bits", protect);
-            cJSON_AddBoolToObject(json, "mosfet_charge", fet_status & 1);
-            cJSON_AddBoolToObject(json, "mosfet_discharge", fet_status & 2);
+            cJSON_AddNumberToObject(json, "protection", prot);
 
-            // Parse Temperatures
-            // NTC values start at byte 23. Each is 2 bytes.
-            // Unit 0.1K. C = (K * 0.1) - 273.15
-            int ntc_offset = 23;
-            for (int i = 0; i < ntc_count; i++) {
-                if (ntc_offset + 1 < len) {
-                    uint16_t raw_temp = (data[ntc_offset] << 8) | data[ntc_offset+1];
-                    double temp_c = (raw_temp * 0.1) - 273.15;
-                    char key[16];
-                    snprintf(key, sizeof(key), "temp_%d", i+1);
-                    cJSON_AddNumberToObject(json, key, temp_c);
-                    ntc_offset += 2;
+            // Temps (Start at byte 23, 2 bytes each)
+            int offset = 23;
+            for(int i=0; i<ntcs; i++) {
+                if(offset+1 < buf[3]) { // check against data len
+                    uint16_t k = (d[offset]<<8)|d[offset+1];
+                    char kStr[16]; snprintf(kStr, 16, "temp_%d", i+1);
+                    cJSON_AddNumberToObject(json, kStr, (k*0.1)-273.15);
+                    offset+=2;
                 }
             }
 
-            // --- 2. Read Register 0x04 (Cell Voltages) ---
-            if (cell_count > 0) {
-                send_read_command(serial_fd, 0x04);
-                usleep(100000);
-                int len_cells = read_response(serial_fd, rx_buffer, sizeof(rx_buffer));
-
-                if (len_cells > 0) {
-                    uint8_t *cdata = &rx_buffer[4];
-                    for (int i = 0; i < cell_count; i++) {
-                        if (i*2 + 1 < len_cells) {
-                            uint16_t cmv = (cdata[i*2] << 8) | cdata[i*2+1];
-                            char key[16];
-                            snprintf(key, sizeof(key), "cell_%d", i+1);
-                            cJSON_AddNumberToObject(json, key, cmv / 1000.0);
+            // 2. Read Cells (0x04)
+            if(cells > 0) {
+                // Short delay between commands
+                usleep(150000);
+                int clen = send_and_read(fd, 0x04, buf, sizeof(buf));
+                if(clen > 0) {
+                    uint8_t *cd = &buf[4];
+                    for(int i=0; i<cells; i++) {
+                        if(i*2+1 < buf[3]) {
+                            uint16_t mv = (cd[i*2]<<8)|cd[i*2+1];
+                            char cStr[16]; snprintf(cStr, 16, "cell_%d", i+1);
+                            cJSON_AddNumberToObject(json, cStr, mv/1000.0);
                         }
                     }
                 }
             }
 
-            // Publish Status
-            char *json_str = cJSON_PrintUnformatted(json);
-            char topic[128];
-            snprintf(topic, sizeof(topic), "%s/status", config.device_id);
-            mosquitto_publish(mosq, NULL, topic, strlen(json_str), json_str, 0, false);
-            printf("Published Data (SOC: %d%%)\n", soc);
-            free(json_str);
+            char *pl = cJSON_PrintUnformatted(json);
+            char top[128]; snprintf(top, 128, "%s/status", config.device_id);
+            mosquitto_publish(mosq, NULL, top, strlen(pl), pl, 0, false);
+            printf("Data Sent: SOC %d%%\n", soc);
+            free(pl);
 
-            // Send Discovery Once (now that we know the counts)
-            if (!discovery_sent && cell_count > 0) {
-                send_discovery(mosq, cell_count, ntc_count);
-                discovery_sent = 1;
+            if(!discovery_done && cells > 0) {
+                send_discovery(mosq, cells, ntcs);
+                discovery_done = 1;
             }
         } else {
-            printf("Failed to read BMS Reg 0x03 (Error Code: %d)\n", len);
+            printf("Read Failed (Err: %d)\n", len);
         }
 
         cJSON_Delete(json);
         sleep(config.poll_interval);
     }
 
-    close(serial_fd);
-    mosquitto_destroy(mosq);
-    mosquitto_lib_cleanup();
+    close(fd);
     return 0;
 }
