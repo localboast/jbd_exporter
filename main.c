@@ -42,30 +42,31 @@ int setup_serial(const char *portname) {
     }
 
     struct termios tty;
-    if (tcgetattr(fd, &tty) != 0) return -1;
+    if (tcgetattr(fd, &tty) != 0) {
+        close(fd);
+        return -1;
+    }
 
+    // Set Baud Rate to 9600
     cfsetospeed(&tty, B9600);
     cfsetispeed(&tty, B9600);
 
-    // 8N1 Configuration
-    tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
-    tty.c_cflag |= (CLOCAL | CREAD);
-    tty.c_cflag &= ~(PARENB | PARODD);
-    tty.c_cflag &= ~CSTOPB;
-    tty.c_cflag &= ~CRTSCTS;
+    // --- CRITICAL FIX: Use cfmakeraw to safely disable all processing ---
+    cfmakeraw(&tty);
 
-    // Raw Mode
-    tty.c_lflag = 0;
-    tty.c_oflag = 0;
-    tty.c_iflag = ~(IXON | IXOFF | IXANY);
+    // Manual overrides to ensure specific settings match JBD reqs
+    tty.c_cflag |= (CLOCAL | CREAD); // Enable receiver
+    tty.c_cflag &= ~CSTOPB;          // 1 stop bit
+    tty.c_cflag &= ~CRTSCTS;         // Disable hardware flow control
+    tty.c_cc[VMIN]  = 0;             // Non-blocking read (we use VTIME)
+    tty.c_cc[VTIME] = 20;            // 2.0 Seconds Timeout
 
-    // Blocking Read with 2.0s Timeout (VTIME * 0.1s)
-    tty.c_cc[VMIN]  = 0;
-    tty.c_cc[VTIME] = 20;
+    if (tcsetattr(fd, TCSANOW, &tty) != 0) {
+        close(fd);
+        return -1;
+    }
 
-    if (tcsetattr(fd, TCSANOW, &tty) != 0) return -1;
-
-    // Clear buffers
+    // Flush any garbage in the buffer
     tcflush(fd, TCIOFLUSH);
     return fd;
 }
@@ -81,7 +82,7 @@ uint16_t jbd_checksum(uint8_t *data, int len) {
 }
 
 int send_and_read(int fd, uint8_t reg, uint8_t *out_buffer, int max_len) {
-    // 1. Clear Input Buffer (Instant, unlike previous loop)
+    // 1. Clear Input Buffer
     tcflush(fd, TCIFLUSH);
 
     // 2. Build Packet
@@ -91,12 +92,13 @@ int send_and_read(int fd, uint8_t reg, uint8_t *out_buffer, int max_len) {
     cmd[2] = reg;
     cmd[3] = 0x00; // Len
 
+    // Checksum: Sum of payload bytes (starting at offset 2, len 2)
     uint16_t cs = jbd_checksum(&cmd[2], 2);
     cmd[4] = (cs >> 8) & 0xFF;
     cmd[5] = cs & 0xFF;
     cmd[6] = 0x77; // End
 
-    print_hex("TX", cmd, 7); // Debug Print
+    print_hex("TX", cmd, 7);
 
     if (write(fd, cmd, 7) != 7) {
         perror("Write failed");
@@ -104,12 +106,12 @@ int send_and_read(int fd, uint8_t reg, uint8_t *out_buffer, int max_len) {
     }
 
     // 3. Read Response
-    // We read one byte at a time to find the Start Byte (0xDD)
+    // We look for 0xDD start byte.
     int total_read = 0;
     int aligned = 0;
     uint8_t header[4];
 
-    // Try to find header (timeout 2s handled by serial config)
+    // Try to find header (timeout handled by VTIME in serial config)
     while (total_read < 4) {
         uint8_t byte;
         int n = read(fd, &byte, 1);
@@ -119,7 +121,7 @@ int send_and_read(int fd, uint8_t reg, uint8_t *out_buffer, int max_len) {
             return -1;
         }
         if (n == 0) {
-            // Timeout
+            // Timeout hit
             return -2;
         }
 
@@ -128,9 +130,9 @@ int send_and_read(int fd, uint8_t reg, uint8_t *out_buffer, int max_len) {
                 aligned = 1;
                 header[0] = byte;
                 total_read = 1;
-                // printf("Found Start Byte\n");
             } else {
-                // printf("Skip: %02X\n", byte); // Uncomment to see garbage
+                // If we see 0x5D here, it confirms the previous ISTRIP bug.
+                // printf("Skipping byte: %02X\n", byte);
             }
         } else {
             header[total_read++] = byte;
@@ -161,25 +163,25 @@ int send_and_read(int fd, uint8_t reg, uint8_t *out_buffer, int max_len) {
 
     print_hex("RX Full", out_buffer, 4 + expected_remaining);
 
-    // Validate Checksum
+    // Validate Checksum (Robust Logic)
     uint8_t *data_ptr = &out_buffer[4];
     uint16_t recv_cs = (out_buffer[4 + data_len] << 8) | out_buffer[4 + data_len + 1];
 
-    // Method 1: Standard (Status + Len + Data)
+    // Method 1: Standard
     uint8_t cs_buf1[256];
     cs_buf1[0] = header[2];
     cs_buf1[1] = header[3];
     memcpy(&cs_buf1[2], data_ptr, data_len);
     uint16_t calc_cs1 = jbd_checksum(cs_buf1, data_len + 2);
 
-    if (recv_cs != calc_cs1) {
-        // Method 2: Quirk for Cell Voltages (observed in some JBD firmwares)
-        if (reg == 0x04 && (recv_cs + 0x30 == calc_cs1)) {
-            // Allowed
-        } else {
-            printf("Checksum Mismatch: Recv=%04X, Calc=%04X\n", recv_cs, calc_cs1);
-            return -5;
-        }
+    int valid = 0;
+    if (recv_cs == calc_cs1) valid = 1;
+    // Checksum Quirk from your working driver
+    else if (reg == 0x04 && (recv_cs + 0x30 == calc_cs1)) valid = 1;
+
+    if (!valid) {
+        printf("Checksum Fail: Recv=%04X, Calc=%04X\n", recv_cs, calc_cs1);
+        return -5;
     }
 
     return 4 + expected_remaining;
@@ -261,7 +263,7 @@ int main() {
 
     load_config("config.ini");
 
-    printf("--- JBD Exporter Debug Mode ---\n");
+    printf("--- JBD Exporter (Raw Mode Fixed) ---\n");
     printf("Port: %s | Broker: %s\n", config.serial_port, config.mqtt_broker);
 
     mosquitto_lib_init();
@@ -331,7 +333,7 @@ int main() {
 
             char *pl = cJSON_PrintUnformatted(json);
             mosquitto_publish(mosq, NULL, "jbd_exporter/status", strlen(pl), pl, 0, false);
-            printf("MQTT Sent: %s\n", pl);
+            printf("MQTT Sent: SOC %d%%\n", soc);
             free(pl);
             cJSON_Delete(json);
 
